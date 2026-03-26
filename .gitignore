@@ -1,0 +1,4 @@
+cuad_app/artifacts
+cuad_app/app/__pycache__/
+cuad_app/.env
+cuad_app/venv/
