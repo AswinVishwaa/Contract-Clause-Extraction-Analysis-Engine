@@ -15,9 +15,9 @@ print("✓ App backend fully initialized.")
 
 def format_chat_history(gradio_history):
     gemini_history = []
-    for user_msg, bot_msg in gradio_history:
-        gemini_history.append({"role": "user", "parts": [user_msg]})
-        gemini_history.append({"role": "model", "parts": [bot_msg]})
+    for msg in gradio_history:
+        role = "model" if msg["role"] == "assistant" else "user"
+        gemini_history.append({"role": role, "parts": [msg["content"]]})
     return gemini_history
 
 # 2. Define UI Callbacks
@@ -56,7 +56,9 @@ def answer_query(message, history, selected_contract):
     gemini_history = format_chat_history(history)
     bot_response = generate_answer(message, top_chunks, history=gemini_history)
 
-    history.append((message, bot_response))
+    history.append({"role": "user", "content": message})
+    history.append({"role": "assistant", "content": bot_response})
+
     return "", history 
 
 def explore_contract(selected_contract):
@@ -103,7 +105,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Legal RAG System") as demo:
         # TAB 1: Chat Interface
         with gr.Tab("💬 1. Chat & Query"):
             gr.Markdown("Ask specific questions about the selected contract. The AI will cite its sources.")
-            chatbot = gr.Chatbot(height=500, show_copy_button=True)
+            chatbot = gr.Chatbot(height=500, show_copy_button=True, type="messages")
             with gr.Row():
                 msg_input = gr.Textbox(show_label=False, placeholder="e.g., What is the cap on liability?", scale=4)
                 submit_btn = gr.Button("Send", variant="primary", scale=1)
