@@ -1,6 +1,5 @@
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
-
 from app.config import RERANKER_MODEL, RERANK_TOP_N, MIN_SCORE
 
 
@@ -15,49 +14,37 @@ class Reranker:
         self.model.eval()
         print("✓ reranker ready")
 
-
     def rerank(self, query: str, chunks: list[dict]) -> list[dict]:
-        """
-        Score each (query, chunk) pair with cross-encoder.
-        Converts raw logits to probabilities via sigmoid.
-        Returns top RERANK_TOP_N chunks sorted by score descending.
-        Also filters below MIN_SCORE threshold.
-        """
         if not chunks:
             return []
 
-        # HF Tokenizers prefer separate lists for batched pairs
-        queries = [query] * len(chunks)
-        texts   = [c["text"] for c in chunks]
+        pairs = [[query, c["text"]] for c in chunks]
 
         with torch.no_grad():
             inputs = self.tokenizer(
-                queries,
-                texts,
+                pairs,
                 padding        = True,
                 truncation     = True,
                 max_length     = 512,
                 return_tensors = "pt"
             )
-            
-            # 1. Get raw logits
-            logits = self.model(**inputs).logits.squeeze(-1)
-            
-            # 2. Convert to 0.0 - 1.0 probability scale using sigmoid
-            scores = torch.sigmoid(logits).tolist()
+            # raw logits — ms-marco cross encoder outputs raw scores
+            # higher = more relevant, no sigmoid needed
+            scores = self.model(**inputs).logits.squeeze(-1).tolist()
 
-        # handle single result edge case
         if isinstance(scores, float):
             scores = [scores]
 
-        # attach reranker probability score to each chunk
         for chunk, score in zip(chunks, scores):
-            chunk["rerank_score"] = score
+            chunk["rerank_score"] = float(score)
 
-        # sort descending
         ranked = sorted(chunks, key=lambda x: -x["rerank_score"])
 
-        # filter low confidence (now correctly comparing probability to 0.30)
-        ranked = [c for c in ranked if c["rerank_score"] > MIN_SCORE]
+        # only filter if ALL scores are very negative
+        # this prevents threshold from killing valid results
+        top = ranked[:RERANK_TOP_N]
+        meaningful = [c for c in top if c["rerank_score"] > MIN_SCORE]
 
-        return ranked[:RERANK_TOP_N]
+        # if threshold kills everything, return top 1 anyway
+        # let Gemini's prompt handle low confidence answers
+        return meaningful if len(meaningful) >= 3 else ranked[:3]

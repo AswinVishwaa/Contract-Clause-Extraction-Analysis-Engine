@@ -10,17 +10,19 @@ ARTIFACTS_DIR = BASE_DIR / "artifacts"
 CHROMA_DIR    = ARTIFACTS_DIR / "chroma_db"
 BM25_PATH     = ARTIFACTS_DIR / "bm25_index.pkl"
 CHUNKS_PATH   = ARTIFACTS_DIR / "all_chunks.pkl"
+FULLTEXT_PATH       = ARTIFACTS_DIR / "contracts_fulltext.pkl"
+
 
 # ── Gemini ───────────────────────────────────────────────────────────
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL    = "gemini-2.5-flash-preview-04-17"
+GEMINI_MODEL    = "gemini-2.5-flash-lite"
 
 # ── Retrieval ────────────────────────────────────────────────────────
-DENSE_TOP_K     = 20    # dense retrieval candidates
-BM25_TOP_K      = 20    # sparse retrieval candidates
+DENSE_TOP_K     = 100    # dense retrieval candidates
+BM25_TOP_K      = 100    # sparse retrieval candidates
 RRF_K           = 60    # RRF smoothing constant (standard)
-RERANK_TOP_N    = 5     # final chunks passed to Gemini
-MIN_SCORE       = 0.30  # below this → "clause not found"
+RERANK_TOP_N    = 10     # final chunks passed to Gemini
+MIN_SCORE       = -5.0  # below this → "clause not found"
 
 # ── Embedding (must match Kaggle) ────────────────────────────────────
 EMBED_MODEL     = "BAAI/bge-small-en-v1.5"
@@ -33,5 +35,6 @@ CHUNK_SIZE      = 512
 CHUNK_OVERLAP   = 50
 CHAR_LIMIT      = CHUNK_SIZE * 4
 OVERLAP_CHARS   = CHUNK_OVERLAP * 4
+FULLTEXT_CHAR_LIMIT = 3_000_000  # fallback to RAG above this
 
 print("✓ config loaded")

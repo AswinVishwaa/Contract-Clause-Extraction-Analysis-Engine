@@ -11,7 +11,7 @@ from rank_bm25 import BM25Okapi
 
 from app.config import (
     CHROMA_DIR, BM25_PATH, CHUNKS_PATH,
-    EMBED_MODEL, DENSE_TOP_K, BM25_TOP_K, RRF_K
+    EMBED_MODEL, DENSE_TOP_K, BM25_TOP_K, RRF_K, FULLTEXT_PATH, FULLTEXT_CHAR_LIMIT
 )
 
 
@@ -46,6 +46,12 @@ class HybridRetriever:
             for c in self.all_chunks
         }
         self.contract_names = sorted(self.contract_map.keys())
+        print("Loading full contract texts...")
+        with open(FULLTEXT_PATH, "rb") as f:
+            fulltext_data = pickle.load(f)
+        self.fulltext_by_name = fulltext_data["by_name"]
+        self.fulltext_by_id   = fulltext_data["by_id"]
+        print(f"  ✓ {len(self.fulltext_by_name)} full texts loaded")
         print(f"  ✓ {len(self.contract_names)} contracts indexed")
         print("✓ HybridRetriever ready\n")
 
@@ -183,3 +189,11 @@ class HybridRetriever:
 
         self.contract_names = sorted(self.contract_map.keys())
         print(f"✓ added {len(new_chunks)} chunks | total: {len(self.all_chunks)}")
+
+    def get_fulltext(self, contract_name: str) -> tuple[str, bool]:
+        """
+        Returns (full_text, is_within_limit).
+        is_within_limit=False means caller should use Strategy B instead.
+        """
+        text = self.fulltext_by_name.get(contract_name, "")
+        return text, len(text) <= FULLTEXT_CHAR_LIMIT

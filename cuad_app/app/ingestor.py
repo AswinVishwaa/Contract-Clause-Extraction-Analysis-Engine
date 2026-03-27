@@ -8,7 +8,6 @@ from app.config import CHAR_LIMIT, OVERLAP_CHARS
 
 # Restored official 41 CUAD categories
 CLAUSE_PATTERNS = {
-    "document_name": r'\b(agreement|contract|amendment|addendum|statement\s+of\s+work)\b',
     "parties": r'\b(entered\s+into|by\s+and\s+between|by\s+and\s+among)\b',
     "agreement_date": r'\b(dated\s+as\s+of|agreement\s+date)\b',
     "effective_date": r'\b(effective\s+date|shall\s+become\s+effective)\b',
@@ -79,15 +78,8 @@ def clean_text(text: str) -> str:
 def detect_clause_type(text: str) -> str:
     text_lower = text.lower()
     for clause_type, pattern in CLAUSE_PATTERNS.items():
-        # skip document_name in first pass — too generic
-        if clause_type == "document_name":
-            continue
         if re.search(pattern, text_lower):
             return clause_type
-    
-    # only fall back to document_name if nothing else matched
-    if re.search(CLAUSE_PATTERNS["document_name"], text_lower):
-        return "document_name"
     return "unknown"
 
 
