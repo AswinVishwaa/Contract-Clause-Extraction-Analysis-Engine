@@ -2,7 +2,7 @@ import google.generativeai as genai
 import os
 
 # Configure your API key
-genai.configure(api_key="AIzaSyB0Y17lUmTzU1HPU9qcbtEulRfT6Sdlu00")
+genai.configure(api_key="")
 
 # List all models and their supported methods
 print("Available models:")
