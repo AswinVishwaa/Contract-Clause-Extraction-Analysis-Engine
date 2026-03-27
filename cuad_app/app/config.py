@@ -15,7 +15,7 @@ FULLTEXT_PATH       = ARTIFACTS_DIR / "contracts_fulltext.pkl"
 
 # ── Gemini ───────────────────────────────────────────────────────────
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL    = "gemini-2.5-flash-lite"
+GEMINI_MODEL    = "gemini-2.5-flash"
 
 # ── Retrieval ────────────────────────────────────────────────────────
 DENSE_TOP_K     = 100    # dense retrieval candidates
@@ -36,5 +36,11 @@ CHUNK_OVERLAP   = 50
 CHAR_LIMIT      = CHUNK_SIZE * 4
 OVERLAP_CHARS   = CHUNK_OVERLAP * 4
 FULLTEXT_CHAR_LIMIT = 3_000_000  # fallback to RAG above this
+
+if not GEMINI_API_KEY:
+    raise EnvironmentError(
+        "GEMINI_API_KEY is not set. Add it to your .env file:\n"
+        "  GEMINI_API_KEY=your_key_here"
+    )
 
 print("✓ config loaded")

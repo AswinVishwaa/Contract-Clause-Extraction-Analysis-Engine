@@ -181,6 +181,10 @@ class HybridRetriever:
 
         self.bm25 = BM25Okapi(self.corpus_tokens)
 
+        # ── Persist BM25 so restarts don't lose uploaded contracts ──
+        with open(BM25_PATH, "wb") as f:
+            pickle.dump({"bm25": self.bm25, "corpus_tokens": self.corpus_tokens}, f)
+
         # update contract map
         for c in new_chunks:
             name = c["metadata"]["contract_name"]

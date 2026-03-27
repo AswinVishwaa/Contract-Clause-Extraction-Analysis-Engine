@@ -5,9 +5,8 @@ import pandas as pd
 from app.retriever import HybridRetriever
 from app.reranker  import Reranker
 from app.ingestor  import ingest_pdf
-from app.generator import generate_answer_stream
 from app.generator import generate_answer_stream, generate_answer_fulltext_stream
-import google.generativeai as genai
+from app.features  import cross_contract_compare, flag_risks, build_clause_matrix
 
 # ── Boot ─────────────────────────────────────────────────────────────
 print("Initializing AI components...")
@@ -33,12 +32,14 @@ def build_source_footer(chunks: list[dict]) -> str:
     seen  = set()
     for i, c in enumerate(chunks, 1):
         meta = c["metadata"]
-        key  = f"{meta['contract_name']}|{meta['clause_type']}"
+        key  = f"{meta['contract_name']}|{meta['clause_type']}|{meta.get('chunk_index', '')}"
         if key not in seen:
             seen.add(key)
-            score = c.get("rerank_score", c.get("score", 0))
+            score    = c.get("rerank_score", c.get("score", 0))
+            page_str = f"p.{meta['page_number']}" if meta.get("page_number") else f"chunk #{meta.get('chunk_index', '?')}"
             lines.append(
                 f"- **[{i}]** `{meta['contract_name']}`  "
+                f"· {page_str}  "
                 f"· clause: `{meta['clause_type']}`  "
                 f"· confidence: `{score:.2f}`"
             )
@@ -47,30 +48,6 @@ def build_source_footer(chunks: list[dict]) -> str:
 
 # ── Callbacks ─────────────────────────────────────────────────────────
 
-def rewrite_query_for_search(user_query: str) -> str:
-    """
-    Translates a conversational user query into a keyword-dense search string
-    optimized for ChromaDB and BM25.
-    """
-    prompt = f"""You are a legal search optimization AI. 
-Extract the core legal concepts, entities, and jurisdictions from the user's question.
-Remove conversational filler like "Which contracts", "Tell me about", "Are there any".
-Output ONLY the optimized search terms on a single line. Do not wrap in quotes.
-
-User Question: {user_query}
-Optimized Search Query:"""
-
-    # Use the fast, cheap lite model so we don't hit your rate limits
-    model = genai.GenerativeModel("gemini-2.0-flash-lite")
-    
-    try:
-        response = model.generate_content(prompt)
-        optimized_query = response.text.strip()
-        return optimized_query
-    except Exception as e:
-        # If the API fails, fall back to the user's original query so the app doesn't crash
-        return user_query
-    
 def answer_query(message: str, history: list, selected_contract: str):
     if not message.strip():
         yield history
@@ -78,7 +55,7 @@ def answer_query(message: str, history: list, selected_contract: str):
 
     target = selected_contract if selected_contract != "All Contracts" else None
 
-    # 1. Immediate UI update
+    # 1. Immediate UI update — show user message
     history = history + [{"role": "user", "content": message}]
     yield history
 
@@ -86,7 +63,7 @@ def answer_query(message: str, history: list, selected_contract: str):
     partial = ""
     gemini_history = format_chat_history(history[:-2])
 
-    # ── STRATEGY A: Full Document Mode ──────────────────────────────
+    # ── STRATEGY A: Full Document Mode ───────────────────────────────
     if target:
         full_text, within_limit = retriever.get_fulltext(target)
         if within_limit and full_text:
@@ -94,33 +71,46 @@ def answer_query(message: str, history: list, selected_contract: str):
                 partial = token
                 history[-1] = {"role": "assistant", "content": partial + " ▍"}
                 yield history
-            
+
             footer = f"\n\n---\n**Source:** `{target}` (Full Document Mode)"
             history[-1] = {"role": "assistant", "content": partial + footer}
             yield history
             return
 
-    # ── STRATEGY B: Hybrid RAG Mode ─────────────────────────────────
-    # We use the original message directly - no "Translator" AI needed.
+    # ── STRATEGY B: Hybrid RAG Mode ──────────────────────────────────
     retrieved  = retriever.retrieve(message, contract_name=target)
     top_chunks = reranker.rerank(message, retrieved)
 
-    # DYNAMIC PROMOTION FALLBACK
+    # Dynamic promotion — if top chunk is very confident, use full doc
     if top_chunks and top_chunks[0]["rerank_score"] > 2.0:
         winner_name = top_chunks[0]["metadata"]["contract_name"]
         full_text, _ = retriever.get_fulltext(winner_name)
-        
+
         if full_text:
-            # We use the batching stream we just wrote above
             for token in generate_answer_fulltext_stream(message, full_text, history=gemini_history):
                 partial = token
                 history[-1] = {"role": "assistant", "content": partial + " ▍"}
                 yield history
-            
+
             footer = f"\n\n---\n**Source:** `{winner_name}` (Dynamic Promotion Mode)"
             history[-1] = {"role": "assistant", "content": partial + footer}
             yield history
             return
+
+    # ── Standard RAG answer ──────────────────────────────────────────
+    if not top_chunks:
+        history[-1] = {"role": "assistant", "content": "No relevant clauses found. Try rephrasing or selecting a specific contract."}
+        yield history
+        return
+
+    for token in generate_answer_stream(message, top_chunks, history=gemini_history):
+        partial = token
+        history[-1] = {"role": "assistant", "content": partial + " ▍"}
+        yield history
+
+    footer = build_source_footer(top_chunks)
+    history[-1] = {"role": "assistant", "content": partial + footer}
+    yield history
 
 
 def process_upload(files, progress=gr.Progress()):
@@ -133,17 +123,14 @@ def process_upload(files, progress=gr.Progress()):
     for i, file in enumerate(files):
         filename = os.path.basename(file.name)
         progress(i / len(files), desc=f"Processing {filename}...")
-        
-        # 1. Chunk and ingest the PDF
+
         contract_name, chunks = ingest_pdf(file.name)
-        
-        # 2. Add chunks to ChromaDB (Strategy B)
         retriever.add_chunks(chunks)
-        
-        # 3. NEW: Stitch chunks back together for Full Document Mode (Strategy A)
+
+        # Stitch chunks for Full Document Mode (Strategy A)
         full_text = "\n\n".join(c["text"] for c in chunks)
         retriever.fulltext_by_name[contract_name] = full_text
-        
+
         results.append(f"✓ `{contract_name}` — {len(chunks)} chunks indexed")
 
     progress(1.0, desc="Done!")
@@ -161,17 +148,16 @@ def explore_contract(selected_contract: str):
     if not cid:
         return pd.DataFrame(columns=["Clause Type", "Excerpt"])
 
-    seen  = {}
+    seen = {}
     for chunk in retriever.all_chunks:
-        meta   = chunk["metadata"]
+        meta  = chunk["metadata"]
         if meta["contract_id"] != cid:
             continue
         ctype = meta["clause_type"]
-        if ctype in ("unknown", "document_name"):
+        if ctype == "unknown":
             continue
-        # keep only first chunk per clause type for summary
         if ctype not in seen:
-            seen[ctype] = chunk["text"][:400] + "..." if len(chunk["text"]) > 400 else chunk["text"]
+            seen[ctype] = chunk["text"][:400] + ("..." if len(chunk["text"]) > 400 else "")
 
     if not seen:
         return pd.DataFrame([{
@@ -179,18 +165,45 @@ def explore_contract(selected_contract: str):
             "Excerpt":     "No specific CUAD clauses found in this contract."
         }])
 
-    rows = [
-        {
-            "Clause Type": k.replace("_", " ").title(),
-            "Excerpt":     v
-        }
+    return pd.DataFrame([
+        {"Clause Type": k.replace("_", " ").title(), "Excerpt": v}
         for k, v in sorted(seen.items())
-    ]
-    return pd.DataFrame(rows)
+    ])
 
 
 def clear_chat():
     return [], ""
+
+
+# ── Analysis tab callbacks ────────────────────────────────────────────
+
+def run_compare(query: str, contracts: list, progress=gr.Progress()):
+    if not query.strip():
+        return "⚠️ Please enter a clause question."
+    if not contracts or len(contracts) < 2:
+        return "⚠️ Please select at least two contracts to compare."
+    progress(0.2, desc="Retrieving clauses...")
+    result = cross_contract_compare(query, contracts, retriever, reranker)
+    progress(1.0)
+    return result
+
+
+def run_risk(selected_contract: str):
+    if not selected_contract or selected_contract == "All Contracts":
+        return pd.DataFrame([{"Clause": "—", "Status": "—",
+                               "Risk Note": "Select a specific contract first.", "Excerpt": "—"}])
+    return flag_risks(selected_contract, retriever)
+
+
+def run_matrix(selected_contract: str, progress=gr.Progress()):
+    progress(0.1, desc="Building matrix...")
+    if selected_contract == "All Contracts":
+        names = retriever.contract_names
+    else:
+        names = [selected_contract]
+    df = build_clause_matrix(retriever, names)
+    progress(1.0)
+    return df
 
 
 # ── UI ────────────────────────────────────────────────────────────────
@@ -234,21 +247,20 @@ css = """
 footer { display: none !important; }
 """
 
-# stats for header
 n_contracts = len(retriever.contract_names)
 n_chunks    = len(retriever.all_chunks)
 
 with gr.Blocks(css=css, theme=gr.themes.Soft(), title="Legal RAG") as demo:
 
     # ── Header ──────────────────────────────────────────────────────
-    gr.HTML(f"""
+    gr.HTML("""
     <div class="header-bar">
         <h1>⚖️ Legal Contract Analysis System</h1>
         <p>Hybrid RAG · Gemini 2.5 Flash · CUAD Dataset · 41 Clause Categories</p>
     </div>
     """)
 
-    # ── Stats row ───────────────────────────────────────────────────
+    # ── Stats row ────────────────────────────────────────────────────
     with gr.Row():
         gr.HTML(f'<div class="stat-box"><div class="stat-num">{n_contracts}</div><div class="stat-label">Contracts indexed</div></div>')
         gr.HTML(f'<div class="stat-box"><div class="stat-num">{n_chunks:,}</div><div class="stat-label">Chunks in vector DB</div></div>')
@@ -258,11 +270,11 @@ with gr.Blocks(css=css, theme=gr.themes.Soft(), title="Legal RAG") as demo:
     # ── Global contract selector ─────────────────────────────────────
     with gr.Row():
         contract_selector = gr.Dropdown(
-            choices  = ["All Contracts"] + retriever.contract_names,
-            value    = "All Contracts",
-            label    = "Active Contract",
-            info     = "Type to search across 510 contracts. Applies to Chat and Explorer tabs.",
-            scale    = 4,
+            choices    = ["All Contracts"] + retriever.contract_names,
+            value      = "All Contracts",
+            label      = "Active Contract",
+            info       = "Type to search across 510 contracts. Applies to all tabs.",
+            scale      = 4,
             filterable = True,
         )
 
@@ -277,17 +289,17 @@ with gr.Blocks(css=css, theme=gr.themes.Soft(), title="Legal RAG") as demo:
                     "The system retrieves relevant clauses and cites its sources."
                 )
                 chatbot = gr.Chatbot(
-                    height          = 480,
-                    show_copy_button= True,
-                    type            = "messages",
-                    placeholder     = (
+                    height           = 480,
+                    show_copy_button = True,
+                    type             = "messages",
+                    placeholder      = (
                         "**Select a contract above, then ask a question.**\n\n"
                         "Try:\n"
                         "- *What is the governing law?*\n"
                         "- *Does this contract have a non-compete clause?*\n"
                         "- *What happens if either party wants to terminate early?*"
                     ),
-                    avatar_images   = (None, "https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg"),
+                    avatar_images = (None, "https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg"),
                 )
                 with gr.Row():
                     msg_box    = gr.Textbox(
@@ -300,7 +312,6 @@ with gr.Blocks(css=css, theme=gr.themes.Soft(), title="Legal RAG") as demo:
                                            scale=1, elem_classes="send-btn")
                     clear_btn  = gr.Button("Clear", scale=1)
 
-                # example queries
                 gr.Examples(
                     examples=[
                         ["What is the governing law of this agreement?"],
@@ -314,7 +325,6 @@ with gr.Blocks(css=css, theme=gr.themes.Soft(), title="Legal RAG") as demo:
                     label="Example questions",
                 )
 
-            # wire streaming
             submit_btn.click(
                 fn      = answer_query,
                 inputs  = [msg_box, chatbot, contract_selector],
@@ -337,9 +347,9 @@ with gr.Blocks(css=css, theme=gr.themes.Soft(), title="Legal RAG") as demo:
                     "and added to the database — immediately queryable in the Chat tab."
                 )
                 upload_box = gr.File(
-                    label       = "Drop PDF contracts here",
-                    file_types  = [".pdf"],
-                    file_count  = "multiple",
+                    label      = "Drop PDF contracts here",
+                    file_types = [".pdf"],
+                    file_count = "multiple",
                 )
                 upload_status = gr.Markdown("*Waiting for upload...*")
 
@@ -370,7 +380,77 @@ with gr.Blocks(css=css, theme=gr.themes.Soft(), title="Legal RAG") as demo:
                     outputs = [clause_table],
                 )
 
-# ── Launch ───────────────────────────────────────────────────────────
+        # Tab 4 — Analysis (Stretch Goals)
+        with gr.Tab("🔍 Analysis"):
+            with gr.Column(elem_classes="tab-content"):
+
+                # ── Cross-Contract Comparison ────────────────────────
+                gr.Markdown("### ⚖️ Cross-Contract Clause Comparison")
+                gr.Markdown(
+                    "Select **two or more contracts** from the dropdown below, "
+                    "then ask a clause question to compare them side-by-side."
+                )
+                compare_selector = gr.Dropdown(
+                    choices    = retriever.contract_names,
+                    multiselect= True,
+                    label      = "Contracts to compare (select 2+)",
+                    filterable = True,
+                )
+                compare_query = gr.Textbox(
+                    label       = "Clause question",
+                    placeholder = "e.g. What are the termination conditions?",
+                )
+                compare_btn = gr.Button("Compare Contracts", variant="primary")
+                compare_out = gr.Markdown()
+
+                compare_btn.click(
+                    fn      = run_compare,
+                    inputs  = [compare_query, compare_selector],
+                    outputs = [compare_out],
+                )
+
+                gr.Markdown("---")
+
+                # ── Risk Flagging ────────────────────────────────────
+                gr.Markdown("### 🚨 Risk Flagging")
+                gr.Markdown(
+                    "Select a specific contract above (global selector), "
+                    "then click **Flag Risks** to see missing protective clauses "
+                    "and detected high-risk clauses."
+                )
+                risk_btn   = gr.Button("Flag Risks", variant="secondary")
+                risk_table = gr.Dataframe(
+                    headers     = ["Clause", "Status", "Risk Note", "Excerpt"],
+                    wrap        = True,
+                    interactive = False,
+                )
+
+                risk_btn.click(
+                    fn      = run_risk,
+                    inputs  = [contract_selector],
+                    outputs = [risk_table],
+                )
+
+                gr.Markdown("---")
+
+                # ── Clause Matrix ────────────────────────────────────
+                gr.Markdown("### 📋 Clause Presence Matrix")
+                gr.Markdown(
+                    "Shows which clause categories are detected per contract. "
+                    "Select **All Contracts** (global selector) for the full 510-row matrix, "
+                    "or pick a single contract to see just that one."
+                )
+                matrix_btn   = gr.Button("Generate Matrix", variant="secondary")
+                matrix_table = gr.Dataframe(wrap=False, interactive=False)
+
+                matrix_btn.click(
+                    fn      = run_matrix,
+                    inputs  = [contract_selector],
+                    outputs = [matrix_table],
+                )
+
+
+# ── Launch ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     demo.launch(
         server_name = "0.0.0.0",

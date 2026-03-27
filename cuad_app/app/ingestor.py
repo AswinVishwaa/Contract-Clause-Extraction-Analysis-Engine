@@ -8,6 +8,7 @@ from app.config import CHAR_LIMIT, OVERLAP_CHARS
 
 # Restored official 41 CUAD categories
 CLAUSE_PATTERNS = {
+    "document_name": r'\b(agreement|contract|amendment|addendum|statement\s+of\s+work)\b',
     "parties": r'\b(entered\s+into|by\s+and\s+between|by\s+and\s+among)\b',
     "agreement_date": r'\b(dated\s+as\s+of|agreement\s+date)\b',
     "effective_date": r'\b(effective\s+date|shall\s+become\s+effective)\b',
@@ -82,7 +83,15 @@ def detect_clause_type(text: str) -> str:
             return clause_type
     return "unknown"
 
+def extract_pages_from_pdf(pdf_path: str) -> list[tuple[int, str]]:
+    """Returns list of (page_number, page_text) — 1-indexed."""
+    doc = fitz.open(pdf_path)
+    pages = [(i + 1, page.get_text()) for i, page in enumerate(doc)]
+    doc.close()
+    return pages
 
+
+# Keep old function as fallback for any callers that pass plain text
 def extract_text_from_pdf(pdf_path: str) -> str:
     doc  = fitz.open(pdf_path)
     text = "\n\n".join(page.get_text() for page in doc)
@@ -90,51 +99,64 @@ def extract_text_from_pdf(pdf_path: str) -> str:
     return text
 
 
-def chunk_text(text: str, contract_id: str,
-               contract_name: str, source: str = "uploaded") -> list[dict]:
-    chunks    = []
+def chunk_text_with_pages(pages: list[tuple[int, str]],
+                           contract_id: str,
+                           contract_name: str,
+                           source: str = "uploaded") -> list[dict]:
+    """
+    Section-aware chunking that preserves page numbers in metadata.
+    pages: list of (page_number, page_text)
+    """
+    result    = []
     chunk_idx = 0
 
-    # split on section headers — keep header attached to its content (Your clean logic!)
-    positions = [m.start() for m in SECTION_HEADER_RE.finditer(text)]
-    positions.append(len(text))
-
-    sections = []
-    if positions[0] > 0:
-        sections.append(text[:positions[0]])
-    for i in range(len(positions) - 1):
-        sections.append(text[positions[i]:positions[i + 1]])
-
-    for section in sections:
-        section = section.strip()
-        if len(section) <= 80:
+    for page_num, raw_page_text in pages:
+        cleaned = clean_text(raw_page_text)
+        if len(cleaned) <= 80:
             continue
-        if len(section) <= CHAR_LIMIT:
-            chunks.append(section)
-        else:
-            start = 0
-            while start < len(section):
-                end        = start + CHAR_LIMIT
-                chunk_text = section[start:end]
-                if len(chunk_text) > 80:
-                    chunks.append(chunk_text)
-                start = end - OVERLAP_CHARS
 
-    result = []
-    for raw_chunk in chunks:
-        result.append({
-            "text": raw_chunk,
-            "metadata": {
-                "contract_id":    contract_id,
-                "contract_name":  contract_name,
-                "source":         source,
-                "chunk_index":    chunk_idx,
-                "clause_type":    detect_clause_type(raw_chunk),
-                "auto_tagged":    False,
-                "char_length":    len(raw_chunk),
-            }
-        })
-        chunk_idx += 1
+        # split this page on section headers
+        positions = [m.start() for m in SECTION_HEADER_RE.finditer(cleaned)]
+        positions.append(len(cleaned))
+
+        sections = []
+        if positions[0] > 0:
+            sections.append(cleaned[:positions[0]])
+        for i in range(len(positions) - 1):
+            sections.append(cleaned[positions[i]:positions[i + 1]])
+
+        for section in sections:
+            section = section.strip()
+            if len(section) <= 80:
+                continue
+
+            if len(section) <= CHAR_LIMIT:
+                sub_chunks = [section]
+            else:
+                sub_chunks = []
+                start = 0
+                while start < len(section):
+                    end = start + CHAR_LIMIT
+                    piece = section[start:end]
+                    if len(piece) > 80:
+                        sub_chunks.append(piece)
+                    start = end - OVERLAP_CHARS
+
+            for piece in sub_chunks:
+                result.append({
+                    "text": piece,
+                    "metadata": {
+                        "contract_id":   contract_id,
+                        "contract_name": contract_name,
+                        "source":        source,
+                        "chunk_index":   chunk_idx,
+                        "page_number":   page_num,
+                        "clause_type":   detect_clause_type(piece),
+                        "auto_tagged":   False,
+                        "char_length":   len(piece),
+                    }
+                })
+                chunk_idx += 1
 
     return result
 
@@ -146,12 +168,9 @@ def ingest_pdf(pdf_path: str) -> tuple[str, list[dict]]:
     """
     path          = Path(pdf_path)
     contract_name = path.stem
-    contract_id   = hashlib.md5(
-        (contract_name).encode()
-    ).hexdigest()[:12]
+    contract_id   = hashlib.md5(contract_name.encode()).hexdigest()[:12]
 
-    raw_text = extract_text_from_pdf(pdf_path)
-    cleaned  = clean_text(raw_text)
-    chunks   = chunk_text(cleaned, contract_id, contract_name, source="uploaded")
+    pages  = extract_pages_from_pdf(pdf_path)
+    chunks = chunk_text_with_pages(pages, contract_id, contract_name, source="uploaded")
 
     return contract_name, chunks

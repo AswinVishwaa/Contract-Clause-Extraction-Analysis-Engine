@@ -96,47 +96,50 @@ def generate_answer_stream(query: str,
             accumulated_text += chunk.text
             yield accumulated_text
 
-def generate_answer_fulltext_stream(query: str, 
+def generate_answer_fulltext_stream(query: str,
                                     full_text: str,
                                     history: list[dict] = None):
-    # 1. Define the limit (roughly 800k tokens to be safe)
-    CHAR_LIMIT_PER_BATCH = 2_500_000 
-    
-    # 2. Split text into batches
-    batches = [full_text[i:i + CHAR_LIMIT_PER_BATCH] 
+    CHAR_LIMIT_PER_BATCH = 2_500_000
+
+    batches = [full_text[i:i + CHAR_LIMIT_PER_BATCH]
                for i in range(0, len(full_text), CHAR_LIMIT_PER_BATCH)]
-    
-    model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=SYSTEM_PROMPT)
-    accumulated_text = ""
+
+    model = genai.GenerativeModel(
+        model_name=GEMINI_MODEL,
+        system_instruction=SYSTEM_PROMPT
+    )
 
     for i, batch_text in enumerate(batches):
         batch_prompt = (
-            f"DOCUMENT BATCH {i+1} of {len(batches)}\n"
+            f"DOCUMENT BATCH {i + 1} of {len(batches)}\n"
             f"CONTEXT:\n{batch_text}\n\n"
             f"QUESTION: {query}\n"
             "INSTRUCTION: If the answer is in this batch, provide it in detail. "
-            "If the answer is NOT in this batch, respond EXACTLY with 'NOT_FOUND_IN_BATCH'."
+            "If the answer is NOT in this batch, respond EXACTLY with 'NOT_FOUND_IN_BATCH' and nothing else."
         )
 
-        response = model.generate_content(batch_prompt, stream=True)
-        
-        batch_response_found = False
-        current_batch_text = ""
+        # ── Collect full batch response first, then decide ──────────
+        try:
+            response = model.generate_content(batch_prompt)
+            full_response = response.text.strip()
+        except Exception:
+            continue
 
-        for chunk in response:
-            try:
+        if full_response == "NOT_FOUND_IN_BATCH":
+            continue
+
+        # Answer found — now stream it token by token for the UI
+        accumulated = ""
+        try:
+            stream_response = model.generate_content(batch_prompt, stream=True)
+            for chunk in stream_response:
                 if chunk.text:
-                    # If this batch has the answer, start streaming it
-                    if "NOT_FOUND_IN_BATCH" not in chunk.text and "NOT_FOUND_IN_BATCH" not in current_batch_text:
-                        batch_response_found = True
-                        current_batch_text += chunk.text
-                        yield current_batch_text
-            except ValueError:
-                pass
-        
-        # If we found the answer in this batch, we stop searching further batches
-        if batch_response_found:
-            return
+                    accumulated += chunk.text
+                    yield accumulated
+        except Exception:
+            # fallback: just yield the non-streamed response we already have
+            yield full_response
 
-    # If we finish all batches and found nothing
+        return  # stop after first batch that has the answer
+
     yield "This information was not found in any section of the document."
